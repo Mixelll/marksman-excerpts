@@ -168,7 +168,7 @@ def train(model, data_loader, device=get_default_device(), loss_fn=None, optimiz
 
 
 def test(model, data_loader, device=get_default_device(), loss=None, metric=None, **kwargs):
-    if loss is None:
+    if model is not None:
         model.eval()
     # if model.is_frozen_ensemble:
     #     data_loader = model.prepare_meta_dataloader(data_loader)
