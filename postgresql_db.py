@@ -61,10 +61,10 @@ from credentials import db_trades
 # conn
 # engine
 
-def connect(dbname=db_trades['dbname'], user=db_trades['user'], password=db_trades['password']):
+def connect(dbname=db_trades.dbname, user=db_trades.user, password=db_trades.password):
     return psg.connect(dbname=dbname, user=user, password=password)
 
-def create_engine(dbname=db_trades['dbname'], user=db_trades['user'], password=db_trades['password']):
+def create_engine(dbname=db_trades.dbname, user=db_trades.user, password=db_trades.password):
     return sqa.create_engine(f'postgresql+psycopg://{user}:{password}@localhost:5432/{dbname}')
 
 
