@@ -1,22 +1,20 @@
+import functools
 import io
 import json
 import numbers
-import numpy as np
-import pandas as pd
-import functools
-
+from collections.abc import Iterable
+from copy import deepcopy
+from datetime import datetime
+from itertools import compress, product
 import statistics as st
 
-import postgresql_db as db
+import numpy as np
+import pandas as pd
+
 import extra_functions as ef
-
-from copy import deepcopy
-
-from datetime import datetime
-from collections.abc import Iterable
-from itertools import product, compress
+import postgresql_db as db
+from m_classes import FunctionWrapper, SELF
 from special_dicts import NestedDict, NestedDictList
-from m_classes import SELF, FunctionWrapper
 
 
 def to_str(model):
@@ -24,6 +22,7 @@ def to_str(model):
         return model.str()
     else:
         return str(model)
+
 
 def save_to_bytes_io(func):
     @functools.wraps(func)
@@ -33,6 +32,7 @@ def save_to_bytes_io(func):
         buffer.seek(0)
         return buffer
     return wrapper
+
 
 class Instancer:
     def __init__(self, obj, *args, permute_kwargs=None, **kwargs):
@@ -45,6 +45,7 @@ class Instancer:
         if self.permute_kwargs is not None:
             return [self.obj(*self.args, **self.kwargs, **kw) for kw in self.permute_kwargs]
         return self.obj(*self.args, **self.kwargs)
+
 
 class MetricInstancer(Instancer):
     def __init__(self, *args, **kwargs):
@@ -66,14 +67,23 @@ class Metric:
     y = None
     last = None
     len = None
+    meta_metric = False
+    # defaults = (('meta_metric', False),)
 
     def __init__(self, top_k_frac=None, top_k_func=abs, top_k_source_y=True):
         self.top_k_frac = top_k_frac
         self.top_k_func = top_k_func
         self.top_k_source_y = top_k_source_y
-        name_add = '' if top_k_frac is None else f'_{round(100 * self.top_k_frac)}'
-        self.name = self.name + name_add
-        self.name2 = self.name2 + name_add
+        self.name_add = '' if top_k_frac is None else f'_{round(100 * self.top_k_frac)}'
+        self.name = self.name + self.name_add
+        self.name2 = self.name2 + self.name_add
+
+        # for k, v in self.defaults:
+        #     if not hasattr(self, k):
+        #         setattr(self, k, v)
+
+        if self.meta_metric:
+            self.source_names = [x + self.name_add for x in self.source_names]
 
     def _post_call(self, out):
         self.last = out
@@ -90,9 +100,11 @@ class Metric:
         return pred, y
 
 
-
-def agg_nested(agg_dict, result_level=1, key=None, filter_none_list=False, update_mean=False, discard_none=True, **kwargs):
+def agg_nested(agg_dict, result_level=1, key=None, filter_none_list=False, update_mean=False, discard_none=True,
+               train_ds_nesting=None,  **kwargs):
     ax = 1
+    if train_ds_nesting is not None:
+        agg_dict = agg_dict.copy().del_n(train_ds_nesting)
     agg = agg_dict.change_nesting(pop_insert=[-2, -2], inner_out=1)
     lvl = -result_level - 1
     agg_lvl = agg.count_levels() - 2
@@ -118,6 +130,7 @@ def agg_nested(agg_dict, result_level=1, key=None, filter_none_list=False, updat
         out['mean'].update_new(agg)
     return out.change_nesting(outer_in=1)
 
+
 def agg4keeper_merged(result, delete_keys=('val',), **kwargs):
     result = result.copy().delete_keys(delete_keys)
     return agg_nested(result, **kwargs).fn(lambda x: x['mean'], level=-1, update=False).change_nesting(outer_in=1)
@@ -136,8 +149,10 @@ class KeeperObj:
     #         new_obj[i] = kb() if not isinstance(kb, BestKeeper) else kb
     #     return new_obj
 
-    def create(self):
+    def create(self, name=None):
         new_obj = self.copy()
+        if name is not None:
+            new_obj.name = name
         return new_obj.fn(lambda kb: kb() if not isinstance(kb, BestKeeper) else kb)
 
     def build_nested(self, zero_result, merged_keeper_modes=SELF('merged_keeper_modes'), merged_kw=None):
@@ -157,9 +172,7 @@ class KeeperObj:
 
         if levels > 1:
             self.fn(build_kb, update=False)
-
         return
-
 
     def check_keep(self, model, results_dict, copy=False, **kwargs):
         if self.fn(lambda kb: kb.check(results_dict), agg_level=0, agg_fn=any, update=False):
@@ -170,7 +183,10 @@ class KeeperObj:
                     model_keep = deepcopy(model)
             else:
                 model_keep = model
-            self.fn(lambda kb: kb.check_keep(model_keep, results_dict, copy=False, **kwargs), update=False)
+            named_list = [self.name] if self.name is not None else []
+            model_keep.keep_history.set_n(named_list + ['result'], results_dict)
+            self.fn(lambda kb, nesting, /: kb.check_keep(model_keep, results_dict, copy=False, nesting=named_list+['kept_by']+list(nesting), **kwargs),
+                    update=False)
         # if any([kb.check(results_dict) for kb in self]):
         #     if copy:
         #         if hasattr(model, 'copy'):
@@ -200,20 +216,17 @@ class KeeperObj:
             return results_out
         return self
 
-
-    def get_models(self, return_list=None):
+    def get_models(self, return_list=None, get_results=False):
         if return_list is None:
             return_list = []
 
-        self.fn(lambda kb: kb.get_models(return_list), update=False)
+        self.fn(lambda kb: kb.get_models(return_list, get_results=get_results), update=False)
         # for kb in self:
         #     kb.get_models(return_list)
         return ef.unique(return_list)
 
-
     def compare_bests(self, other, **kwargs):
         return self.func_with_other(lambda x, y: x.compare_bests(y, **kwargs), other)
-
 
     def _clear(self):
         self.fn(lambda kb: kb.clear(), update=False)
@@ -241,11 +254,11 @@ class KeeperList(KeeperObj, NestedDictList):
         return NestedDict({kb.name: kb.best_agg() for kb in self})
 
 
-
 class BestKeeper:
     agg_dict = None
     merged_keeper = None
     # agg_level = None
+
     def __init__(self, metric=None, best=None, model=None, list_fn=all, result_nesting_level=1, name=None,
                  result_bool=None, test_fn=None, n_best=1):
         self.metric = metric
@@ -306,8 +319,7 @@ class BestKeeper:
         else:
             return self.best
 
-
-    def check(self, result, return_nested=False):
+    def check(self, result, return_nested=False, model=None):
 
         if self.agg_dict is not None:
             # aggregate_level
@@ -315,13 +327,12 @@ class BestKeeper:
             if return_nested:
                 return out
             else:
-                merged_res = NestedDict({4: agg4keeper_merged(result, result_level=4)})
+                merged_res = NestedDict({4: agg4keeper_merged(result, result_level=4, train_ds_nesting=model.config['train_ds'] if model is not None else None)})
                 if self.merged_keeper is not None:
                     return out.any() | self.merged_keeper.fn(lambda x, nesting, /: x.check(merged_res.get_n(nesting)), update=False).any()
                 return out.any()
 
         return self.models_result_deque.insert_sorted((None, result), check_only=True,)
-
 
     def keep(self, model, result, copy=False, add_tuples=()):
         if copy:
@@ -330,32 +341,41 @@ class BestKeeper:
             _model = model
         self.models_result_deque.insert_sorted(tuple([_model, result] + list(add_tuples)), check_only=False)
 
-
-    def check_keep(self, model, result, copy=False, **kwargs):
-        if self.agg_dict is not None:
+    def check_keep(self, model, result, copy=False, nesting=None, **kwargs):
+        nesting_ls = list(nesting) if nesting is not None else []
+        if self.agg_dict is not None or self.merged_keeper is not None:
             if self.merged_keeper is not None:
-                merged_res = NestedDict({f'level_{mode}': agg4keeper_merged(result, result_level=mode) for mode in self.merged_keeper_modes})
+                merged_res = NestedDict({f'level_{mode}': agg4keeper_merged(result, result_level=mode, train_ds_nesting=model.config['train_ds'])
+                                         for mode in self.merged_keeper_modes})
                 # merged_res = NestedDict({4: agg4keeper_merged(result, result_level=4)})
-                self.merged_keeper.fn(lambda x, nesting, /: x.check_keep(model, merged_res.get_n(nesting), copy=copy, **kwargs), update=False)
-            return self.agg_dict.fn(lambda x, nesting, /: x.check_keep(model, result.get_n(nesting), copy=copy, **kwargs), update=False)
-        if self.check(result):
-            self.keep(model, result, copy=copy)
-            return True
-        else:
-            return False
 
-    def get_models(self, return_list=None):
+                self.merged_keeper.fn(lambda x, _nesting, /: x.check_keep(model, merged_res.get_n(_nesting), copy=copy, nesting=nesting_ls+list(_nesting), **kwargs), update=False)
+            if self.agg_dict is not None:
+                return self.agg_dict.fn(lambda x, _nesting, /: x.check_keep(model, result.get_n(_nesting), copy=copy, nesting=nesting_ls+list(_nesting), **kwargs), update=False)
+        else:
+            if self.check(result, model=model):
+                model.keep_history.set_n(nesting_ls + [self.name], result)
+                self.keep(model, result, copy=copy, **kwargs)
+                return True
+            else:
+                return False
+
+    def get_models(self, return_list=None, get_results=False):
         def nested_get_models(y):
             return y.fn(lambda x, nesting, /: x.get_models(return_list), update=False)
 
         if return_list is None:
             return_list = []
         if len(self.models_result_deque):
-            return_list.extend(ef.get_sub_lists_i(self.models_result_deque, i=0))
+            if get_results:
+                return_list.extend(tuple(self.models_result_deque))
+            else:
+                return_list.extend(ef.get_sub_lists_i(self.models_result_deque, i=0))
         if self.agg_dict is not None:
             nested_get_models(self.agg_dict)
             nested_get_models(self.merged_keeper)
-
+        if get_results:
+            return ef.unique(return_list, accessor=ef.AccessorK(0), aggregate=True, aggregate_mode=0)
         return ef.unique(return_list)
 
     def clear(self):
@@ -371,7 +391,6 @@ class BestKeeper:
         self.get_models(return_list)
         self.clear()
         return return_list
-
 
     def __call__(self, model, result, **kwargs):
         self.check_keep(model, result, copy=True, **kwargs)
@@ -392,8 +411,9 @@ class MetricComparer:
         _add_name = '' if add_name is None else f'_{add_name if isinstance(add_name, str) else "_".join(add_name)}'
         self.name += _add_name
         self.name2 += _add_name
+
     def __call__(self, result, best=None):
-        metric = lambda x: self.metric((x  if self.func is None else self.func(x)) if self.key is None else (x[self.key] if self.func is None else self.func(x[self.key])))
+        metric = lambda x: self.metric((x if self.func is None else self.func(x)) if self.key is None else (x[self.key] if self.func is None else self.func(x[self.key])))
         # def metric(x):
         #     return self.metric(self.func(x) if self.key is None else self.func(x[self.key]))
 
@@ -456,7 +476,6 @@ class TargetFunction:
                 return loc_obj
 
 
-
 def get_result_dict(loaders, test_lambda, test_names=None, func=None, **kwargs):
     if func is None:
         func = lambda x: x
@@ -464,6 +483,7 @@ def get_result_dict(loaders, test_lambda, test_names=None, func=None, **kwargs):
         test_names = {}
     if not isinstance(loaders, (list, tuple)):
         loaders = [loaders]
+
     def get_result(loader_optional_nested, i=None, **kw):
 
         if isinstance(loader_optional_nested, dict):
@@ -482,10 +502,12 @@ def get_result_dict(loaders, test_lambda, test_names=None, func=None, **kwargs):
         result_i_d.update(get_result(loader, i=test_names.get(i) or str(i), **kwargs))
     return NestedDict.from_dict(result_i_d)
 
+
 def list_loader_fn(loaders, fn, **kwargs):
     if not isinstance(loaders, (list, tuple)):
         loaders = [loaders]
     return [(NestedDict.from_dict(loader) if isinstance(loader, dict) else loader).fn(fn, **kwargs) for loader in loaders]
+
 
 def fit_shell(train_lambda, test_lambda, epochs, train_loader, test_loader_epoch,
               test_loader_final, test_names=None, loader_fn_kw=None, keepers=None,
@@ -516,6 +538,7 @@ def fit_shell(train_lambda, test_lambda, epochs, train_loader, test_loader_epoch
     if frozen_ensemble_flag:
         ensemble_model = _model
         preproc_fn = ensemble_model.prepare_meta_dataloader
+
         def nested_preproc(x):
             return list_loader_fn(x, preproc_fn, update=False)
         # nested_preproc = lambda x: list_loader_fn(x, preproc_fn, update=False)
@@ -537,6 +560,7 @@ def fit_shell(train_lambda, test_lambda, epochs, train_loader, test_loader_epoch
                     _test_dl = _dl_cache['test_dl']
                 else:
                     _preproc_fn = _ensemble_model.prepare_meta_dataloader
+
                     def _nested_preproc(x):
                         return list_loader_fn(x, _preproc_fn, update=False)
 
@@ -612,7 +636,7 @@ def fit_shell(train_lambda, test_lambda, epochs, train_loader, test_loader_epoch
     # print(f"FINAL")
     # if frozen_ensemble_flag:
     #     test_loader_final = nested_preproc(test_loader_final)
-    # return NestedDict({'final': get_result(test_loader_final, prints=bool(print_flag)), 'epochs': results_epochs.concat()})
+    return results_epochs.concat()
 
 
 def test_shell(data_loader_loop, metric=None, return_structure=False, name=None, prints=True):
@@ -626,15 +650,21 @@ def test_shell(data_loader_loop, metric=None, return_structure=False, name=None,
     # print([p.grad for p in model.parameters()])
     loss_v = data_loader_loop(metric) if not return_structure else None
     if return_structure or loss_v is not None:
-        out = {'loss': loss_v}
+        out_l = {'loss': loss_v}
     else:
-        out = {}
+        out_l = {}
+
     if metric is not None:
         # print(f"Test Error: \n {metric('', '')}: {(metric):>0.1f}%, Avg loss: {loss:>8f} \n")
+        out_t = out_l.copy()
         if return_structure:
-            out |= {m.name: None for m in metric}
+            out_t |= {m.name: None for m in metric}
         else:
-            out |= {m.name: m.compute(mean=0) for m in metric}
+            out_t |= {m.name: m.compute(mean=0) for m in metric if not m.meta_metric}
+            out_t |= {m.name: m.compute(metric_dict=out_t) for m in metric if m.meta_metric}
+        out = out_l | {m.name: out_t[m.name] for m in metric}
+    else:
+        out = out_l
     out_nd = NestedDict.from_dict(out)
     if not return_structure:
         rounded = out_nd.fn(lambda x: x.tolist() if isinstance(x, np.ndarray) else x, update=False).fn(ef.round_to, 6)
@@ -644,6 +674,7 @@ def test_shell(data_loader_loop, metric=None, return_structure=False, name=None,
             else:
                 print(f'{name}: {rounded}')
     return out
+
 
 def ts_make_ds(dict_split, inp_cols, tgt_cols, sequence_length, func=lambda x, y: (x, y), set_attr=None, return_ds=False):
     X_train, y_train = [], []
@@ -664,18 +695,47 @@ def ts_make_ds(dict_split, inp_cols, tgt_cols, sequence_length, func=lambda x, y
         if return_ds:
             return train_ds
 
+
 class MeanAbsoluteError:
     name = 'MAE'
     name2 = 'mae'
     alias = 'mean_absolute_error'
+
     def __call__(self, pred, y, mean=None, **kwargs):
         pred, y = self.transform_pred_y(pred, y, **kwargs)
         out = self.mean(abs(pred - y), mean=mean)
         self._post_call(out)
         return out
 
+
+class MeanAbsoluteSignal:
+    name = 'MAS'
+    name2 = 'mas'
+    alias = 'mean_absolute_signal'
+    
+    def __call__(self, pred, y, mean=None, **kwargs):
+        pred, y = self.transform_pred_y(pred, y, **kwargs)
+        out = self.mean(abs(y), mean=mean)
+        self._post_call(out)
+        return out
+
+
+class MeanErrorRatio:
+    name = 'MER'
+    name2 = 'mer'
+    alias = 'mean_error_ratio'
+    meta_metric = True
+    source_names = ['MAE', 'MAS']
+
+    def __call__(self, metric_dict, **kwargs):
+        out = metric_dict[self.source_names[0]] / metric_dict[self.source_names[1]]
+        self._post_call(out)
+        return out
+
+
 class SignHitPercent:
     alias = 'sign_hit_percent'
+
     def __init__(self, zero_lim=0, **kwargs):
         if zero_lim is None:
             self.zth = 0
@@ -696,26 +756,18 @@ class SignHitPercent:
         condition = ((pred * y) > 0) | ((abs(pred) <= self.zth) & (abs(y) <= self.zth))
         # if condition_conversion is not None:
         #     condition = condition_conversion(condition, pred)
-        out =  self.mean(1.0 * condition, mean=mean)
+        out = self.mean(1.0 * condition, mean=mean)
         self._post_call(out)
         return out
+
 
 class MeanOutputRatio:
     name = 'MOR'
     name2 = 'mor'
     alias = 'mean_output_ratio'
+
     def __call__(self, pred, y, mean=None, **kwargs):
         pred, y = self.transform_pred_y(pred, y, **kwargs)
         out =  self.mean(abs(pred), mean=mean) / self.mean(abs(y), mean=mean)
-        self._post_call(out)
-        return out
-
-class MeanAbsoluteSignal:
-    name = 'MAS'
-    name2 = 'mas'
-    alias = 'mean_absolute_signal'
-    def __call__(self, pred, y, mean=None, **kwargs):
-        pred, y = self.transform_pred_y(pred, y, **kwargs)
-        out = self.mean(abs(y), mean=mean)
         self._post_call(out)
         return out

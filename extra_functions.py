@@ -1,26 +1,54 @@
 import copy
+import functools as ft
+import inspect
 import io
 import json
-import pytz
+import logging
 import pickle as pickle_pkg
+import traceback
+from collections import deque
+from collections.abc import Iterable
+from datetime import datetime, timedelta
+from decimal import Decimal
+from math import ceil, floor, log10
+
 import numpy as np
 import pandas as pd
+import pytz
 
-
-from decimal import Decimal
-from datetime import datetime, timedelta
-from math import log10, floor, ceil
-from pytz import timezone
-from tzlocal import get_localzone
-from collections.abc import Iterable
-
-from inspect import signature
-from collections import deque
+from datetime_functions import *
+from decortools import *
 from type_classes import *
 
+
+# Setup logging configuration
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+
+def convert_df_fn(df, class_):
+    if class_ is list:
+        return df.to_dict('records')
+    elif class_ is dict:
+        return df.to_dict()
+    elif class_ is tuple:
+        return [tuple(x) for x in df.to_numpy()]
+    elif class_ is set:
+        return [set(x) for x in df.to_numpy()]
+    elif class_ is np.ndarray:
+        return df.to_numpy()
+    elif class_ is pd.Series:
+        return df.squeeze()
+    elif class_ is pd.DataFrame:
+        return df
+    else:
+        return class_(df)
+
+
+
 # Useful
-# wrapper class that adds a state to a function
 class FuncWithState:
+    """ wrapper class that adds a state to a function"""
     def __init__(self, fn, state=None, state_kwarg=None):
         self.fn = fn
         self.state = state if state is not None else {}
@@ -185,6 +213,7 @@ class SortedDeque(deque):
 def get_sub_lists_i(lst, i=0):
     return list(list(zip(*lst))[i])
 
+
 # Useful
 class StdoutRedirect:
     def __init__(self):
@@ -211,6 +240,7 @@ class StdoutRedirect:
     def reset_stdout(self):
         sys.stdout = self.original_stdout
 
+
 # Useful
 class StdoutRedirectWithExit(StdoutRedirect):
 
@@ -220,7 +250,6 @@ class StdoutRedirectWithExit(StdoutRedirect):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.reset_stdout()  # Reset sys.stdout to its original state
-
 
 
 class TeeStream:
@@ -271,10 +300,41 @@ def is_list_in_list_order(a, b):
     return False
 
 
-def unique(seq):
-    seen = set()
-    seen_add = seen.add
-    return [x for x in seq if not (x in seen or seen_add(x))]
+def unique(seq, accessor=None, aggregate=False, aggregate_mode=0):
+    """
+    Returns a list of unique elements in a sequence.
+    If an accessor function is provided, it is used to extract the key for each element.
+    If aggregate is True, the function will return a list of tuples where the first element is the unique element
+    determined by the accessor function and the rest are the elements that were aggregated.
+    """
+    if accessor is None:
+        seen = set()
+        seen_add = seen.add
+        return [x for x in seq if not (x in seen or seen_add(x))]
+    elif aggregate:
+        out = {}
+        for x in seq:
+            x_acc = accessor(x)
+            id_ = id(x_acc)
+            rest = [y for y in x if y != x_acc]
+            if id_ not in seen:
+                seen_add(id_)
+                if aggregate_mode == 0:
+                    out[id_] = (x, [rest])
+                elif aggregate_mode == 1:
+                    out[id_] = (x, *([y] for y in rest))
+            else:
+                if aggregate_mode == 0:
+                    out[id_][1].append(rest)
+                elif aggregate_mode == 1:
+                    for i, y in enumerate(out[id_][1:]):
+                        y.extend(rest[i])
+        return list(out.values())
+    else:
+        seen = set()
+        seen_add = seen.add
+        return [x for x in seq if not (accessor(x) in seen or seen_add(accessor(x)))]
+
 
 # Useful
 def flatten(xs, type_=Iterable, return_outer=False, temp_list=None, return_list=True):
@@ -308,15 +368,6 @@ def get_mantissa(number):
     return Decimal(number).scaleb(-get_exponent(number)).normalize()
 
 
-# Useful
-# decorator to copy the signature of a function to another function
-def copy_signature(source_fct):
-    def _copy(target_fct):
-        target_fct.__signature__ = signature(source_fct)
-        return target_fct
-    return _copy
-
-
 def join_dataframes_on_index(dataframe_dict, single=lambda x: 'date' in x):
 
     dataframe_dict.fn_k_v(lambda k, v: add_suffix_to_column_names(v, prefix=k, ignore=single))
@@ -345,14 +396,13 @@ def add_suffix_to_column_names(dataframe, prefix=None, suffix=None, sep='_', ign
     dataframe.columns = new_columns
     return dataframe
 
+
 def to_ny_tz(ts, local=True):
     return to_timezone(ts, 'America/New_York', local=local)
 
+
 def ny_localize(ts):
     return pytz.timezone('America/New_York').localize(ts)
-
-def now_as_tz(ts):
-    return to_timezone(datetime.now(), get_timezone(ts), local=True)
 
 
 
@@ -610,6 +660,7 @@ def object_captain_hook(o, default = [(str2pd_interval, pd.DataFrame.from_dict),
         o = od
     return od
 
+
 def iter_length(*args):
     out = []
     for x in args:
@@ -659,58 +710,6 @@ def round_to(x, sig):
         else:
             return x.__class__(map(lambda y: round_to(y, sig), x))
 
-
-def get_timezone(x):
-    typeStr = str(type(x)).lower()
-    if isinstance(x, str):
-        out = x
-    elif typeStr.find('pandas') != -1:
-        try:
-            out = x.dt.tz
-        except:
-            out = x.tz
-    elif typeStr.find('tzfile') != -1:
-        out = x.zone
-    else:
-        out = x.tzinfo.zone
-    return out
-
-
-def to_timezone(inp, tz=None, naive=False, local=False):
-    type_str = str(type(inp)).lower()
-    localize_tz = str(get_localzone()) if local else 'UTC'
-    if tz is None:
-        tz = localize_tz
-    if 'pandas' in type_str:
-        try:
-            if inp.tz is None:
-                out = inp.tz_localize(localize_tz,
-                                      nonexistent='shift_backward').tz_convert(str(tz))
-            else:
-                out = inp.tz_convert(tz)
-            if naive:
-                out = out.tz_localize(None)
-        except:
-            if inp.dt.tz is None:
-                out = inp.dt.tz_localize(localize_tz, ambiguous='infer',
-                                         nonexistent='shift_backward').dt.tz_convert(str(tz))
-            else:
-                out = inp.dt.tz_convert(tz)
-            if naive:
-                out = out.dt.tz_localize(None)
-
-    else:
-        if inp.tzinfo is None:
-            out = timezone(localize_tz).localize(inp)
-        else:
-            out = inp
-        if isinstance(tz, str):
-            out = out.astimezone(timezone(tz))
-        else:
-            out = out.astimezone(tz)
-        if naive:
-            out = out.replace(tzinfo=None)
-    return out
 
 
 def td2str_tq(time_quants, time_quants_vals, delta, unit=None, space=False, no_prefix=False, by_ratio=False, r=1):
